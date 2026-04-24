@@ -1,28 +1,59 @@
 const TelegramBot = require('node-telegram-bot-api');
 const { createClient } = require('@supabase/supabase-js');
-const fs = require('fs');
-const path = require('path');
 const fetch = require('node-fetch');
-const FormData = require('form-data');
 const mm = require('music-metadata');
+const crypto = require('crypto');
 
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
-const BOT_TOKEN = process.env.BOT_TOKEN || '8735781048:AAFVC3jH5tkjTxYXsswZ42Op858mjXrWKfU';
+const BOT_TOKEN   = process.env.BOT_TOKEN   || '8735781048:AAFVC3jH5tkjTxYXsswZ42Op858mjXrWKfU';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://rdwrkvsdcudzttnywuai.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_YsoKq4O182TiMVR-AGj8lQ_7XflhXBh';
-const SITE_URL = process.env.SITE_URL || 'https://latexplay.github.io/LatexPlay/index.html';
+const SITE_URL    = process.env.SITE_URL    || 'https://latexplay.github.io/LatexPlay/app.html';
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+const sb  = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-console.log('🎵 LatexPlay Bot started');
+// Поддерживаемые аудио форматы
+const AUDIO_MIME_TYPES = new Set([
+  'audio/mpeg', 'audio/mp3',
+  'audio/mp4', 'audio/m4a', 'audio/x-m4a',
+  'audio/flac', 'audio/x-flac',
+  'audio/ogg', 'audio/vorbis',
+  'audio/wav', 'audio/x-wav', 'audio/wave',
+  'audio/aac', 'audio/x-aac',
+  'audio/opus',
+  'audio/webm',
+  'audio/3gpp', 'audio/3gpp2',
+]);
+
+const AUDIO_EXTENSIONS = new Set([
+  'mp3', 'm4a', 'flac', 'ogg', 'wav', 'aac', 'opus', 'wma', 'alac', 'aiff', 'aif', 'webm', '3gp',
+]);
+
+function isAudioFile(mimeType, fileName) {
+  if (mimeType && AUDIO_MIME_TYPES.has(mimeType.toLowerCase())) return true;
+  if (fileName) {
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    if (ext && AUDIO_EXTENSIONS.has(ext)) return true;
+  }
+  return false;
+}
+
+function getAudioMime(fileName, originalMime) {
+  const ext = fileName?.split('.').pop()?.toLowerCase();
+  const map = {
+    mp3: 'audio/mpeg', m4a: 'audio/mp4', flac: 'audio/flac',
+    ogg: 'audio/ogg', wav: 'audio/wav', aac: 'audio/aac',
+    opus: 'audio/opus', wma: 'audio/x-ms-wma', aiff: 'audio/aiff',
+    aif: 'audio/aiff', webm: 'audio/webm',
+  };
+  return (ext && map[ext]) || originalMime || 'audio/mpeg';
+}
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
+  return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 }
 
 function formatDuration(seconds) {
@@ -32,11 +63,12 @@ function formatDuration(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-async function getTelegramPhotoUrl(bot, userId) {
+async function getTelegramPhotoUrl(userId) {
   try {
     const photos = await bot.getUserProfilePhotos(userId, { limit: 1 });
-    if (photos.total_count === 0) return null;
-    const fileId = photos.photos[0][0].file_id;
+    if (!photos || photos.total_count === 0) return null;
+    const fileId = photos.photos[0]?.[0]?.file_id;
+    if (!fileId) return null;
     const file = await bot.getFile(fileId);
     return `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
   } catch {
@@ -45,88 +77,79 @@ async function getTelegramPhotoUrl(bot, userId) {
 }
 
 async function getOrCreateProfile(telegramUser) {
-  const avatarUrl = await getTelegramPhotoUrl(bot, telegramUser.id);
+  try {
+    const avatarUrl = await getTelegramPhotoUrl(telegramUser.id);
+    const displayName = [telegramUser.first_name, telegramUser.last_name].filter(Boolean).join(' ');
 
-  // Check existing
-  const { data: existing } = await sb
-    .from('profiles')
-    .select('*')
-    .eq('telegram_id', telegramUser.id)
-    .single();
+    const { data: existing } = await sb
+      .from('profiles').select('*').eq('telegram_id', telegramUser.id).single();
 
-  if (existing) {
-    // Update avatar if changed
-    if (avatarUrl && avatarUrl !== existing.avatar_url) {
-      await sb.from('profiles').update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() }).eq('id', existing.id);
-      existing.avatar_url = avatarUrl;
+    if (existing) {
+      if (avatarUrl && avatarUrl !== existing.avatar_url) {
+        await sb.from('profiles').update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() }).eq('id', existing.id);
+        existing.avatar_url = avatarUrl;
+      }
+      return existing;
     }
-    return existing;
+
+    const { data: newProfile, error } = await sb.from('profiles').insert({
+      telegram_id: telegramUser.id,
+      username:    telegramUser.username || null,
+      display_name: displayName,
+      avatar_url:  avatarUrl,
+    }).select().single();
+
+    if (error) { console.error('Profile create error:', error); return null; }
+    return newProfile;
+  } catch (err) {
+    console.error('getOrCreateProfile error:', err);
+    return null;
   }
-
-  // Create new
-  const displayName = [telegramUser.first_name, telegramUser.last_name].filter(Boolean).join(' ');
-  const { data: newProfile } = await sb.from('profiles').insert({
-    telegram_id: telegramUser.id,
-    username: telegramUser.username || null,
-    display_name: displayName,
-    avatar_url: avatarUrl,
-  }).select().single();
-
-  return newProfile;
 }
 
 // ─── /start ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const user = msg.from;
+  await getOrCreateProfile(msg.from);
 
-  await getOrCreateProfile(user);
-
-  const welcome = `🎵 *Добро пожаловать в LatexPlay!*
-
-Это бот для загрузки музыки на платформу [LatexPlay](${SITE_URL}).
-
-*Что умеет бот:*
-• 🔗 /connect — получить код для входа на сайт
-• 🎵 Отправь MP3 файл — он появится на платформе
-• 📋 /mytracks — список твоих треков
-• ❌ /delete — удалить трек
-• ℹ️ /help — помощь
-
-Начни с /connect чтобы привязать аккаунт к сайту!`;
-
-  await bot.sendMessage(chatId, welcome, {
-    parse_mode: 'Markdown',
-    disable_web_page_preview: true,
-  });
+  await bot.sendMessage(chatId,
+    `🎵 *Добро пожаловать в LatexPlay!*\n\n` +
+    `Загружай музыку прямо из Telegram — она появится на платформе.\n\n` +
+    `*Поддерживаемые форматы:*\nMP3, M4A, FLAC, OGG, WAV, AAC, OPUS и другие\n\n` +
+    `*Команды:*\n` +
+    `• 🔗 /connect — получить код для входа на сайт\n` +
+    `• 🎵 Отправь аудио файл — он появится на платформе\n` +
+    `• 📋 /mytracks — список твоих треков\n` +
+    `• ❌ /delete — удалить трек\n` +
+    `• ℹ️ /help — помощь\n\n` +
+    `Начни с /connect чтобы привязать аккаунт к сайту!`,
+    { parse_mode: 'Markdown', disable_web_page_preview: true }
+  );
 });
 
 // ─── /connect ───────────────────────────────────────────────────────────────
 bot.onText(/\/connect/, async (msg) => {
   const chatId = msg.chat.id;
-  const user = msg.from;
+  const user   = msg.from;
 
   try {
-    const avatarUrl = await getTelegramPhotoUrl(bot, user.id);
+    const avatarUrl   = await getTelegramPhotoUrl(user.id);
     const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ');
-    const code = generateCode();
+    const code        = generateCode();
 
-    // Delete old codes for this user
     await sb.from('auth_codes').delete().eq('telegram_id', user.id).eq('used', false);
-
-    // Insert new code
     await sb.from('auth_codes').insert({
       code,
-      telegram_id: user.id,
+      telegram_id:      user.id,
       telegram_username: user.username || null,
-      display_name: displayName,
-      avatar_url: avatarUrl,
-      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      display_name:     displayName,
+      avatar_url:       avatarUrl,
+      expires_at:       new Date(Date.now() + 10 * 60 * 1000).toISOString(),
     });
 
     await bot.sendMessage(chatId,
       `🔑 *Твой код для входа:*\n\n\`${code}\`\n\n` +
-      `Введи его на [сайте](${SITE_URL}/app.html) в поле авторизации.\n\n` +
+      `Введи его на [сайте](${SITE_URL}) в поле авторизации.\n\n` +
       `⏳ Код действителен *10 минут*`,
       { parse_mode: 'Markdown', disable_web_page_preview: true }
     );
@@ -138,14 +161,16 @@ bot.onText(/\/connect/, async (msg) => {
 
 // ─── /help ──────────────────────────────────────────────────────────────────
 bot.onText(/\/help/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId,
+  await bot.sendMessage(msg.chat.id,
     `ℹ️ *Справка LatexPlay Bot*\n\n` +
     `*/start* — приветствие\n` +
     `*/connect* — получить код для входа на сайт\n` +
     `*/mytracks* — посмотреть свои загруженные треки\n` +
-    `*/delete* — удалить трек по номеру из списка\n\n` +
-    `*Загрузка музыки:*\nПросто отправь боту MP3 файл. Бот автоматически прочитает теги (название, исполнитель, жанр, обложка) и загрузит трек на платформу.\n\n` +
+    `*/delete [номер]* — удалить трек\n\n` +
+    `*Загрузка музыки:*\n` +
+    `Просто отправь боту аудио файл любого формата:\n` +
+    `MP3 · M4A · FLAC · OGG · WAV · AAC · OPUS · WMA и другие\n\n` +
+    `Бот автоматически прочитает теги (название, исполнитель, жанр, обложка) и загрузит трек.\n\n` +
     `*Сайт:* ${SITE_URL}`,
     { parse_mode: 'Markdown', disable_web_page_preview: true }
   );
@@ -154,20 +179,16 @@ bot.onText(/\/help/, async (msg) => {
 // ─── /mytracks ──────────────────────────────────────────────────────────────
 bot.onText(/\/mytracks/, async (msg) => {
   const chatId = msg.chat.id;
-  const user = msg.from;
+  const { data: profile } = await sb.from('profiles').select('id').eq('telegram_id', msg.from.id).single();
 
-  const { data: profile } = await sb.from('profiles').select('id').eq('telegram_id', user.id).single();
-  if (!profile) {
-    return bot.sendMessage(chatId, '❌ Аккаунт не найден. Используй /connect для привязки.');
-  }
+  if (!profile) return bot.sendMessage(chatId, '❌ Аккаунт не найден. Используй /connect для привязки.');
 
-  const { data: tracks } = await sb.from('tracks').select('id, title, artist, genre, duration, play_count, created_at')
+  const { data: tracks } = await sb.from('tracks')
+    .select('id, title, artist, genre, duration, play_count, created_at')
     .eq('uploaded_by', profile.id)
     .order('created_at', { ascending: false });
 
-  if (!tracks || tracks.length === 0) {
-    return bot.sendMessage(chatId, '🎵 У тебя пока нет загруженных треков.\n\nОтправь мне MP3 файл!');
-  }
+  if (!tracks?.length) return bot.sendMessage(chatId, '🎵 У тебя пока нет загруженных треков.\n\nОтправь мне аудио файл!');
 
   let text = `🎵 *Твои треки (${tracks.length}):*\n\n`;
   tracks.forEach((t, i) => {
@@ -176,8 +197,7 @@ bot.onText(/\/mytracks/, async (msg) => {
     if (t.genre) text += ` \`[${t.genre}]\``;
     text += `\n   ▶️ ${t.play_count || 0} прослушиваний · ${formatDuration(t.duration)}\n\n`;
   });
-
-  text += `\nДля удаления: /delete \`номер\`\nПример: /delete \`1\``;
+  text += `\nДля удаления: /delete \`номер\``;
 
   await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
 });
@@ -185,221 +205,228 @@ bot.onText(/\/mytracks/, async (msg) => {
 // ─── /delete ────────────────────────────────────────────────────────────────
 bot.onText(/\/delete(?:\s+(\d+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const user = msg.from;
-  const num = match[1] ? parseInt(match[1]) : null;
+  const num    = match[1] ? parseInt(match[1]) : null;
 
-  if (!num) {
-    return bot.sendMessage(chatId, 'Укажи номер трека: /delete `1`\n\nПосмотреть список: /mytracks', { parse_mode: 'Markdown' });
-  }
+  if (!num) return bot.sendMessage(chatId, 'Укажи номер трека: /delete `1`\n\nПосмотреть список: /mytracks', { parse_mode: 'Markdown' });
 
-  const { data: profile } = await sb.from('profiles').select('id').eq('telegram_id', user.id).single();
+  const { data: profile } = await sb.from('profiles').select('id').eq('telegram_id', msg.from.id).single();
   if (!profile) return bot.sendMessage(chatId, '❌ Аккаунт не найден.');
 
-  const { data: tracks } = await sb.from('tracks').select('id, title')
-    .eq('uploaded_by', profile.id)
-    .order('created_at', { ascending: false });
+  const { data: tracks } = await sb.from('tracks').select('id, title, file_url')
+    .eq('uploaded_by', profile.id).order('created_at', { ascending: false });
 
-  if (!tracks || tracks.length === 0) return bot.sendMessage(chatId, '🎵 Нет треков для удаления.');
-
+  if (!tracks?.length) return bot.sendMessage(chatId, '🎵 Нет треков для удаления.');
   const track = tracks[num - 1];
   if (!track) return bot.sendMessage(chatId, `❌ Трека с номером ${num} нет. У тебя ${tracks.length} треков.`);
 
-  // Delete from storage
+  // Удаляем файл из storage
   try {
-    const fileKey = track.id + '.mp3';
-    await sb.storage.from('tracks').remove([fileKey]);
+    // Пробуем удалить по пути из URL
+    const url = new URL(track.file_url);
+    const pathParts = url.pathname.split('/tracks/');
+    if (pathParts[1]) await sb.storage.from('tracks').remove([pathParts[1]]);
   } catch {}
 
-  // Delete from DB
   await sb.from('tracks').delete().eq('id', track.id);
-
   await bot.sendMessage(chatId, `✅ Трек *${track.title}* удалён.`, { parse_mode: 'Markdown' });
 });
 
-// ─── MP3 UPLOAD ─────────────────────────────────────────────────────────────
-bot.on('audio', handleAudio);
+// ─── AUDIO HANDLERS ─────────────────────────────────────────────────────────
+// Telegram присылает аудио как `audio` (когда Telegram распознаёт как музыку)
+// или как `document` (когда отправлено как файл)
+bot.on('audio', (msg) => handleAudio(msg, false));
+
 bot.on('document', async (msg) => {
-  if (msg.document && (msg.document.mime_type === 'audio/mpeg' || msg.document.file_name?.endsWith('.mp3'))) {
+  const doc = msg.document;
+  if (!doc) return;
+  if (isAudioFile(doc.mime_type, doc.file_name)) {
     await handleAudio(msg, true);
   } else {
-    await bot.sendMessage(msg.chat.id, '❌ Отправь MP3 файл чтобы загрузить трек.');
+    await bot.sendMessage(msg.chat.id, '❌ Этот формат не поддерживается.\n\nОтправь аудио файл: MP3, M4A, FLAC, OGG, WAV, AAC, OPUS и другие.');
   }
+});
+
+// voice — это голосовые, не музыка, но на всякий случай обработаем
+bot.on('voice', async (msg) => {
+  await bot.sendMessage(msg.chat.id, '❌ Голосовые сообщения не принимаются.\n\nОтправь аудио файл: MP3, M4A, FLAC, OGG, WAV и другие.');
 });
 
 async function handleAudio(msg, isDocument = false) {
   const chatId = msg.chat.id;
-  const user = msg.from;
+  const user   = msg.from;
 
-  // Get or create profile
-  const profile = await getOrCreateProfile(user);
-  if (!profile) {
-    return bot.sendMessage(chatId, '❌ Ошибка профиля. Попробуй /start');
+  // Безопасно получаем объект файла
+  const fileObj = isDocument ? msg.document : msg.audio;
+  if (!fileObj || !fileObj.file_id) {
+    return bot.sendMessage(chatId, '❌ Не удалось получить файл. Попробуй отправить ещё раз.');
   }
+
+  const profile = await getOrCreateProfile(user);
+  if (!profile) return bot.sendMessage(chatId, '❌ Ошибка профиля. Попробуй /start');
 
   const statusMsg = await bot.sendMessage(chatId, '⏳ Загружаю трек...');
 
-  try {
-    const fileObj = isDocument ? msg.document : msg.audio;
-    const fileId = fileObj.file_id;
-    const fileSize = fileObj.file_size;
+  const edit = (text) => bot.editMessageText(text, {
+    chat_id: chatId, message_id: statusMsg.message_id
+  }).catch(() => {});
 
-    // 50MB limit
+  try {
+    const fileId   = fileObj.file_id;
+    const fileSize = fileObj.file_size || 0;
+    const fileName = fileObj.file_name || (isDocument ? 'track' : `${msg.audio?.title || 'track'}.mp3`);
+    const mimeType = fileObj.mime_type || getAudioMime(fileName, 'audio/mpeg');
+
     if (fileSize > 50 * 1024 * 1024) {
-      await bot.editMessageText('❌ Файл слишком большой. Максимум 50MB.', { chat_id: chatId, message_id: statusMsg.message_id });
-      return;
+      return edit('❌ Файл слишком большой. Максимум 50MB.');
     }
 
-    // Download file
-    await bot.editMessageText('⏳ Скачиваю файл...', { chat_id: chatId, message_id: statusMsg.message_id });
+    // Скачиваем файл
+    await edit('⏳ Скачиваю файл...');
     const fileLink = await bot.getFileLink(fileId);
     const fileResp = await fetch(fileLink);
+    if (!fileResp.ok) throw new Error('Не удалось скачать файл');
     const fileBuffer = Buffer.from(await fileResp.arrayBuffer());
 
-    // Parse metadata
-    await bot.editMessageText('🔍 Читаю теги...', { chat_id: chatId, message_id: statusMsg.message_id });
+    // Читаем метаданные
+    await edit('🔍 Читаю теги...');
 
-    let title = 'Unknown Track';
-    let artist = null;
-    let album = null;
-    let genre = null;
+    let title    = null;
+    let artist   = null;
+    let album    = null;
+    let genre    = null;
     let duration = null;
     let coverBuffer = null;
-    let coverMime = null;
+    let coverMime   = null;
 
     try {
-      const metadata = await mm.parseBuffer(fileBuffer, 'audio/mpeg');
+      const metadata = await mm.parseBuffer(fileBuffer, mimeType);
       const tags = metadata.common;
       const info = metadata.format;
 
-      if (tags.title) title = tags.title;
-      else if (msg.audio?.title) title = msg.audio.title;
-      else if (fileObj.file_name) title = fileObj.file_name.replace(/\.mp3$/i, '');
+      title    = tags.title   || null;
+      artist   = tags.artist  || null;
+      album    = tags.album   || null;
+      genre    = tags.genre?.[0] || null;
+      duration = info.duration ? Math.round(info.duration) : null;
 
-      if (tags.artist) artist = tags.artist;
-      else if (msg.audio?.performer) artist = msg.audio.performer;
-
-      album = tags.album || null;
-      genre = tags.genre?.[0] || null;
-      duration = info.duration ? Math.round(info.duration) : (msg.audio?.duration || null);
-
-      // Cover image
-      if (tags.picture && tags.picture.length > 0) {
+      if (tags.picture?.length > 0) {
         coverBuffer = Buffer.from(tags.picture[0].data);
-        coverMime = tags.picture[0].format || 'image/jpeg';
+        coverMime   = tags.picture[0].format || 'image/jpeg';
       }
     } catch (metaErr) {
       console.warn('Metadata parse failed:', metaErr.message);
-      title = msg.audio?.title || fileObj.file_name?.replace(/\.mp3$/i, '') || 'Unknown Track';
-      artist = msg.audio?.performer || null;
-      duration = msg.audio?.duration || null;
     }
 
-    // Upload audio to Supabase Storage
-    await bot.editMessageText('📤 Загружаю на сервер...', { chat_id: chatId, message_id: statusMsg.message_id });
+    // Фолбэк на Telegram поля
+    if (!title) {
+      title = msg.audio?.title
+        || fileName.replace(/\.[^.]+$/, '')
+        || 'Unknown Track';
+    }
+    if (!artist && msg.audio?.performer) artist = msg.audio.performer;
+    if (!duration && msg.audio?.duration)  duration = msg.audio.duration;
 
-    const trackId = crypto.randomUUID ? crypto.randomUUID() : require('crypto').randomUUID();
-    const audioPath = `${trackId}.mp3`;
+    // Загружаем аудио в Supabase Storage
+    await edit('📤 Загружаю на сервер...');
+
+    const trackId  = crypto.randomUUID();
+    const fileExt  = fileName.split('.').pop()?.toLowerCase() || 'mp3';
+    const audioPath = `${trackId}.${fileExt}`;
+    const uploadMime = getAudioMime(fileName, mimeType);
 
     const { error: uploadErr } = await sb.storage
       .from('tracks')
-      .upload(audioPath, fileBuffer, { contentType: 'audio/mpeg', upsert: false });
+      .upload(audioPath, fileBuffer, { contentType: uploadMime, upsert: false });
 
     if (uploadErr) {
       console.error('Upload error:', uploadErr);
-      await bot.editMessageText('❌ Ошибка загрузки файла: ' + uploadErr.message, { chat_id: chatId, message_id: statusMsg.message_id });
-      return;
+      return edit('❌ Ошибка загрузки файла: ' + uploadErr.message);
     }
 
-    const { data: publicUrl } = sb.storage.from('tracks').getPublicUrl(audioPath);
-    const fileUrl = publicUrl.publicUrl;
+    const { data: pubData } = sb.storage.from('tracks').getPublicUrl(audioPath);
+    const fileUrl = pubData.publicUrl;
 
-    // Upload cover if exists
+    // Загружаем обложку
     let coverUrl = null;
     if (coverBuffer) {
       try {
-        const coverExt = coverMime.includes('png') ? 'png' : 'jpg';
+        const coverExt  = coverMime?.includes('png') ? 'png' : 'jpg';
         const coverPath = `covers/${trackId}.${coverExt}`;
-        await sb.storage.from('tracks').upload(coverPath, coverBuffer, { contentType: coverMime, upsert: false });
-        const { data: coverPub } = sb.storage.from('tracks').getPublicUrl(coverPath);
-        coverUrl = coverPub.publicUrl;
-      } catch (coverErr) {
-        console.warn('Cover upload failed:', coverErr.message);
+        const { error: covErr } = await sb.storage.from('tracks').upload(coverPath, coverBuffer, { contentType: coverMime, upsert: false });
+        if (!covErr) {
+          const { data: covPub } = sb.storage.from('tracks').getPublicUrl(coverPath);
+          coverUrl = covPub.publicUrl;
+        }
+      } catch (e) {
+        console.warn('Cover upload failed:', e.message);
       }
     }
 
-    // Save to DB
+    // Сохраняем в БД
     const { data: newTrack, error: dbErr } = await sb.from('tracks').insert({
-      id: trackId,
-      title,
-      artist,
-      album,
-      genre,
-      duration,
-      file_url: fileUrl,
-      cover_url: coverUrl,
-      uploaded_by: profile.id,
-      play_count: 0,
+      id: trackId, title, artist, album, genre,
+      duration, file_url: fileUrl, cover_url: coverUrl,
+      uploaded_by: profile.id, play_count: 0,
     }).select().single();
 
     if (dbErr) {
       console.error('DB error:', dbErr);
-      await bot.editMessageText('❌ Ошибка сохранения: ' + dbErr.message, { chat_id: chatId, message_id: statusMsg.message_id });
-      return;
+      return edit('❌ Ошибка сохранения: ' + dbErr.message);
     }
 
-    // Update genre preferences
+    // Обновляем жанровые предпочтения
     if (genre && profile.id) {
       try {
         const genreKey = genre.toLowerCase();
-        const { data: existing } = await sb.from('genre_preferences')
+        const { data: gp } = await sb.from('genre_preferences')
           .select('*').eq('profile_id', profile.id).eq('genre', genreKey).single();
-
-        if (existing) {
-          await sb.from('genre_preferences').update({ score: existing.score + 5, updated_at: new Date().toISOString() })
-            .eq('id', existing.id);
+        if (gp) {
+          await sb.from('genre_preferences').update({ score: gp.score + 5, updated_at: new Date().toISOString() }).eq('id', gp.id);
         } else {
           await sb.from('genre_preferences').insert({ profile_id: profile.id, genre: genreKey, score: 5 });
         }
       } catch {}
     }
 
-    // Success message
+    // Сообщение об успехе
+    const ext = fileExt.toUpperCase();
     let successText = `✅ *Трек загружен!*\n\n`;
     successText += `🎵 *${title}*\n`;
-    if (artist) successText += `👤 ${artist}\n`;
-    if (album) successText += `💿 ${album}\n`;
-    if (genre) successText += `🏷️ ${genre}\n`;
+    if (artist)   successText += `👤 ${artist}\n`;
+    if (album)    successText += `💿 ${album}\n`;
+    if (genre)    successText += `🏷️ ${genre}\n`;
     if (duration) successText += `⏱️ ${formatDuration(duration)}\n`;
-    successText += `\n[Открыть на сайте](${SITE_URL}/app.html)`;
+    successText += `📁 Формат: ${ext}\n`;
+    successText += `\n[Открыть на сайте](${SITE_URL})`;
 
+    await edit(successText);
+    // Пробуем добавить parse_mode через sendMessage если editMessageText не поддержит
     await bot.editMessageText(successText, {
       chat_id: chatId,
       message_id: statusMsg.message_id,
       parse_mode: 'Markdown',
       disable_web_page_preview: true,
-    });
+    }).catch(() => {});
 
   } catch (err) {
     console.error('Audio handler error:', err);
-    await bot.editMessageText('❌ Произошла ошибка: ' + err.message, {
-      chat_id: chatId,
-      message_id: statusMsg.message_id,
-    }).catch(() => {});
+    await edit('❌ Произошла ошибка: ' + err.message);
   }
 }
 
-// ─── UNKNOWN ────────────────────────────────────────────────────────────────
+// ─── UNKNOWN MESSAGES ────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
-  if (msg.audio || msg.document) return;
-  if (msg.text && msg.text.startsWith('/')) return;
-
+  if (msg.audio || msg.document || msg.voice) return;
+  if (msg.text?.startsWith('/')) return;
   if (msg.text) {
     await bot.sendMessage(msg.chat.id,
-      `Отправь MP3 файл чтобы загрузить трек 🎵\n\nИли используй:\n/connect — войти на сайт\n/mytracks — мои треки\n/help — помощь`
+      `Отправь аудио файл чтобы загрузить трек 🎵\n\nПоддерживается: MP3, M4A, FLAC, OGG, WAV, AAC, OPUS\n\nИли используй:\n/connect — войти на сайт\n/mytracks — мои треки\n/help — помощь`
     );
   }
 });
 
-// ─── ERROR HANDLING ─────────────────────────────────────────────────────────
+// ─── ERROR HANDLING ──────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => console.error('Polling error:', err.message));
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
+
+console.log('🎵 LatexPlay Bot started — supporting MP3, M4A, FLAC, OGG, WAV, AAC, OPUS and more');
