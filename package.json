@@ -1,0 +1,22 @@
+{
+  "name": "latexplay-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for LatexPlay music platform",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "music-metadata": "^7.14.0",
+    "node-fetch": "^2.7.0",
+    "node-telegram-bot-api": "^0.64.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
